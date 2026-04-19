@@ -73,3 +73,25 @@ loadData().then(() => {
   const port = process.env.PORT || 3000;
   app.listen(port, () => console.log(`Listening on ${port}`));
 });
+
+app.post("/api/readouts/:name", async (req, res) => {
+  const { name } = req.params;
+  const { lo, hi, de } = req.body;
+
+  if (!data[name]) {
+    return res.status(404).json({ error: "Unknown readout" });
+  }
+
+  const entry = data[name];
+
+  if (typeof lo === "number") entry.lo = lo;
+  if (typeof hi === "number") entry.hi = hi;
+  if (typeof de === "number") {
+    entry.de = Math.max(entry.lo, Math.min(entry.hi, de));
+  }
+
+  await saveData();
+  emitUpdate();
+
+  res.json({ name, entry });
+});
