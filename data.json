@@ -1,0 +1,3 @@
+{
+  "temp": { "lo": 0, "hi": 500, "de": 100, "type": ["core", "env", "pwr"] }
+}
