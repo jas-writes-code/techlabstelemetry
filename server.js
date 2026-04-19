@@ -1,31 +1,45 @@
 import express from "express";
 import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
 
 const app = express();
+app.disable("x-powered-by");
 app.use(express.json());
 
-const DATA_FILE = "./data.json";
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DATA_FILE = path.join(__dirname, "data.json");
 
-/* ---------- HARD CORS FIX ---------- */
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+const DEFAULT_DATA = {
+  temp: { lo: 0, hi: 500, de: 100, type: ["core", "env", "pwr"] }
+};
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
-
-  next();
-});
-
-/* ---------- DATA ---------- */
 let data = {};
 let clients = [];
 
+function sendCors(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
+
+app.use((req, res, next) => {
+  sendCors(res);
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 async function loadData() {
-  const raw = await fs.readFile(DATA_FILE, "utf8");
-  data = JSON.parse(raw);
+  try {
+    const raw = await fs.readFile(DATA_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    data = parsed && typeof parsed === "object" ? parsed : structuredClone(DEFAULT_DATA);
+  } catch {
+    data = structuredClone(DEFAULT_DATA);
+    await saveData();
+  }
 }
 
 async function saveData() {
@@ -34,10 +48,22 @@ async function saveData() {
 
 function emitUpdate() {
   const payload = `data: ${JSON.stringify(data)}\n\n`;
-  clients.forEach(res => res.write(payload));
+  for (const res of clients) {
+    res.write(payload);
+  }
 }
 
-/* ---------- ROUTES ---------- */
+function clamp(value, lo, hi) {
+  return Math.max(lo, Math.min(hi, value));
+}
+
+app.get("/", (req, res) => {
+  res.type("json").send({ ok: true, service: "readouts-api" });
+});
+
+app.get("/healthz", (req, res) => {
+  res.json({ ok: true });
+});
 
 app.get("/api/readouts", (req, res) => {
   res.json(data);
@@ -45,27 +71,22 @@ app.get("/api/readouts", (req, res) => {
 
 app.get("/api/readouts/:type", (req, res) => {
   const { type } = req.params;
-
   const filtered = Object.fromEntries(
-    Object.entries(data).filter(([, e]) =>
-      Array.isArray(e.type) && e.type.includes(type)
-    )
+    Object.entries(data).filter(([, entry]) => Array.isArray(entry.type) && entry.type.includes(type))
   );
-
   res.json(filtered);
 });
 
-/* adjust value */
 app.post("/api/readouts/:name/adjust", async (req, res) => {
   const { name } = req.params;
-  const delta = Number(req.body.delta || 0);
+  const delta = Number(req.body?.delta ?? 0);
 
-  if (!data[name]) {
+  const entry = data[name];
+  if (!entry) {
     return res.status(404).json({ error: "Unknown readout" });
   }
 
-  const entry = data[name];
-  entry.de = Math.max(entry.lo, Math.min(entry.hi, entry.de + delta));
+  entry.de = clamp(Number(entry.de) + delta, Number(entry.lo), Number(entry.hi));
 
   await saveData();
   emitUpdate();
@@ -73,21 +94,23 @@ app.post("/api/readouts/:name/adjust", async (req, res) => {
   res.json({ name, entry });
 });
 
-/* full update */
 app.post("/api/readouts/:name", async (req, res) => {
   const { name } = req.params;
-  const { lo, hi, de } = req.body;
+  const entry = data[name];
 
-  if (!data[name]) {
+  if (!entry) {
     return res.status(404).json({ error: "Unknown readout" });
   }
 
-  const entry = data[name];
+  const body = req.body ?? {};
 
-  if (typeof lo === "number") entry.lo = lo;
-  if (typeof hi === "number") entry.hi = hi;
-  if (typeof de === "number") {
-    entry.de = Math.max(entry.lo, Math.min(entry.hi, de));
+  if (typeof body.lo === "number" && Number.isFinite(body.lo)) entry.lo = body.lo;
+  if (typeof body.hi === "number" && Number.isFinite(body.hi)) entry.hi = body.hi;
+
+  if (typeof body.de === "number" && Number.isFinite(body.de)) {
+    entry.de = clamp(body.de, entry.lo, entry.hi);
+  } else {
+    entry.de = clamp(Number(entry.de), Number(entry.lo), Number(entry.hi));
   }
 
   await saveData();
@@ -96,29 +119,32 @@ app.post("/api/readouts/:name", async (req, res) => {
   res.json({ name, entry });
 });
 
-/* ---------- SSE STREAM (important fix here too) ---------- */
 app.get("/api/stream", (req, res) => {
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  sendCors(res);
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
 
-  /* ensure CORS ALSO on SSE */
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  res.flushHeaders();
+  res.flushHeaders?.();
 
   res.write(`data: ${JSON.stringify(data)}\n\n`);
-
   clients.push(res);
 
   req.on("close", () => {
-    clients = clients.filter(c => c !== res);
+    clients = clients.filter((client) => client !== res);
   });
 });
 
-/* ---------- START ---------- */
+const port = Number(process.env.PORT || 10000);
 
-loadData().then(() => {
-  const port = process.env.PORT || 3000;
-  app.listen(port, () => console.log(`Running on ${port}`));
-});
+loadData()
+  .then(() => {
+    app.listen(port, "0.0.0.0", () => {
+      console.log(`Readouts API listening on ${port}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Startup failed:", err);
+    process.exit(1);
+  });
